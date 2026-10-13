@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<title>YGOPro 卡表產生器</title>
+<style>
+  :root { font-family: "Segoe UI", "Microsoft JhengHei", sans-serif; }
+  body { margin: 0; display: flex; height: 100vh; background: #1b1e26; color: #eee; }
+  #left { width: 38%; padding: 16px; box-sizing: border-box; border-right: 1px solid #333; overflow-y: auto; }
+  #right { flex: 1; padding: 16px; box-sizing: border-box; overflow-y: auto; }
+  h2 { margin-top: 0; font-size: 16px; color: #9fd3ff; }
+  #preview { max-width: 100%; border: 1px solid #444; margin-top: 8px; }
+  button { background: #2d6cdf; color: #fff; border: none; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #3f7fef; }
+  button.secondary { background: #444; }
+  button.secondary:hover { background: #555; }
+  input[type=text], input[type=number] { background: #2a2d36; border: 1px solid #444; color: #eee; padding: 4px 6px; border-radius: 3px; }
+  label { font-size: 12px; color: #aaa; display: block; margin-top: 10px; }
+  .row { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+  .section-title { font-size: 15px; color: #ffd27a; margin: 18px 0 6px; border-bottom: 1px solid #444; padding-bottom: 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  td, th { padding: 3px 4px; border-bottom: 1px solid #2a2d36; text-align: left; vertical-align: middle; }
+  td.thumb img { width: 48px; display: block; }
+  select, input.idbox { width: 100%; box-sizing: border-box; font-size: 12px; }
+  .dist { color: #888; font-size: 11px; }
+  .empty-bucket { color: #777; font-size: 11px; }
+  #status { font-size: 12px; color: #8f8; min-height: 18px; margin-top: 8px; white-space: pre-wrap; }
+  #summary { font-size: 12px; background: #20232c; padding: 8px; border-radius: 4px; margin-top: 10px; max-height: 220px; overflow-y: auto; }
+  .count-input { width: 42px; }
+  .badge { display:inline-block; font-size: 10px; padding: 1px 5px; border-radius: 3px; background:#333; color:#ccc; margin-left:4px; }
+</style>
+</head>
+<body>
+
+<div id="left">
+  <h2>① 匯入牌組截圖</h2>
+  <input type="file" id="fileInput" accept="image/*">
+  <img id="preview" style="display:none;">
+
+  <label>欄數(留空=自動偵測)</label>
+  <input type="number" id="colsHint" placeholder="自動" style="width:80px;">
+
+  <label>列數覆寫(若自動偵測漏掉最後幾列,可在此強制指定;留空=自動)</label>
+  <div class="row">
+    主<input type="number" id="rowsMain" placeholder="自動" style="width:50px;">
+    額外<input type="number" id="rowsExtra" placeholder="自動" style="width:50px;">
+    側<input type="number" id="rowsSide" placeholder="自動" style="width:50px;">
+  </div>
+
+  <div class="row" style="margin-top:14px;">
+    <button id="analyzeBtn">分析圖片</button>
+    <button class="secondary" id="rebuildBtn">重建圖片快取</button>
+  </div>
+  <div id="status"></div>
+
+  <h2 style="margin-top:24px;">② 匯出 .ydk</h2>
+  <label>牌組名稱</label>
+  <input type="text" id="deckName" placeholder="例如 光と闇の儀式4" style="width:100%; box-sizing:border-box;">
+  <div class="row" style="margin-top:10px;">
+    <button id="exportBtn">寫出 .ydk 到 deck 資料夾</button>
+  </div>
+  <div id="exportStatus" style="font-size:12px; color:#8cf; margin-top:6px;"></div>
+
+  <div id="summary"></div>
+</div>
+
+<div id="right">
+  <div id="sections"></div>
+</div>
+
+<script>
+const fileInput = document.getElementById('fileInput');
+const preview = document.getElementById('preview');
+const analyzeBtn = document.getElementById('analyzeBtn');
+const rebuildBtn = document.getElementById('rebuildBtn');
+const statusEl = document.getElementById('status');
+const sectionsEl = document.getElementById('sections');
+const summaryEl = document.getElementById('summary');
+const exportBtn = document.getElementById('exportBtn');
+const exportStatus = document.getElementById('exportStatus');
+
+let currentFile = null;
+let lastResult = null; // {sections:[{label,cells:[{row,col,bucket,thumb,candidates,selectedId,manualId}]}]}
+
+fileInput.addEventListener('change', () => {
+  currentFile = fileInput.files[0];
+  if (!currentFile) return;
+  preview.src = URL.createObjectURL(currentFile);
+  preview.style.display = 'block';
+});
+
+rebuildBtn.addEventListener('click', async () => {
+  statusEl.textContent = '重建快取中(第一次會比較久)...';
+  rebuildBtn.disabled = true;
+  try {
+    await fetch('/api/rebuild_cache', { method: 'POST' });
+    statusEl.textContent = '快取已重建。';
+  } catch (e) {
+    statusEl.textContent = '重建失敗: ' + e;
+  }
+  rebuildBtn.disabled = false;
+});
+
+analyzeBtn.addEventListener('click', async () => {
+  if (!currentFile) { statusEl.textContent = '請先選擇圖片。'; return; }
+  statusEl.textContent = '分析中,第一次執行需要建立圖片快取,可能需要 1~2 分鐘...';
+  analyzeBtn.disabled = true;
+  const fd = new FormData();
+  fd.append('image', currentFile);
+  const cols = document.getElementById('colsHint').value;
+  if (cols) fd.append('cols', cols);
+  const rowsMain = document.getElementById('rowsMain').value;
+  const rowsExtra = document.getElementById('rowsExtra').value;
+  const rowsSide = document.getElementById('rowsSide').value;
+  if (rowsMain) fd.append('rows_main', rowsMain);
+  if (rowsExtra) fd.append('rows_extra', rowsExtra);
+  if (rowsSide) fd.append('rows_side', rowsSide);
+  try {
+    const resp = await fetch('/api/analyze', { method: 'POST', body: fd });
+    if (!resp.ok) throw new Error(await resp.text());
+    lastResult = await resp.json();
+    lastResult.sections.forEach(sec => sec.cells.forEach(cell => {
+      cell.selectedId = cell.candidates.length ? cell.candidates[0].id : null;
+      cell.manualId = '';
+    }));
+    render();
+    statusEl.textContent = `完成。共偵測到 ${lastResult.sections.map(s=>s.label+':'+s.cells.length).join(', ')} 張非空白卡格。`;
+  } catch (e) {
+    statusEl.textContent = '分析失敗: ' + e;
+  }
+  analyzeBtn.disabled = false;
+});
+
+function labelZh(l) {
+  return {main:'主卡組', extra:'額外卡組', side:'側卡組'}[l] || l;
+}
+
+function render() {
+  sectionsEl.innerHTML = '';
+  lastResult.sections.forEach((sec, secIdx) => {
+    const title = document.createElement('div');
+    title.className = 'section-title';
+    title.textContent = `${labelZh(sec.label)} (偵測到 ${sec.cells.length} 格, ${sec.cols} 欄 x ${sec.rows} 列)`;
+    sectionsEl.appendChild(title);
+
+    const table = document.createElement('table');
+    table.innerHTML = '<tr><th>圖</th><th>分類</th><th>候選</th><th>手動指定卡號</th></tr>';
+    sec.cells.forEach((cell, cellIdx) => {
+      const tr = document.createElement('tr');
+
+      const tdThumb = document.createElement('td');
+      tdThumb.className = 'thumb';
+      const img = document.createElement('img');
+      img.src = cell.thumb;
+      tdThumb.appendChild(img);
+      tr.appendChild(tdThumb);
+
+      const tdBucket = document.createElement('td');
+      tdBucket.innerHTML = `<span class="badge">${cell.bucket}</span><br><span class="dist">r${cell.row} c${cell.col}</span>`;
+      tr.appendChild(tdBucket);
+
+      const tdCand = document.createElement('td');
+      if (cell.candidates.length === 0) {
+        tdCand.innerHTML = '<span class="empty-bucket">無候選(該分類下 pics 快取為空)</span>';
+      } else {
+        const sel = document.createElement('select');
+        cell.candidates.forEach(c => {
+          const opt = document.createElement('option');
+          opt.value = c.id;
+          opt.textContent = `${c.name} (#${c.id}, d=${c.dist})`;
+          sel.appendChild(opt);
+        });
+        sel.value = cell.selectedId;
+        sel.addEventListener('change', () => {
+          cell.selectedId = parseInt(sel.value);
+          cell.manualId = '';
+          updateSummary();
+        });
+        tdCand.appendChild(sel);
+      }
+      tr.appendChild(tdCand);
+
+      const tdManual = document.createElement('td');
+      const inp = document.createElement('input');
+      inp.className = 'idbox';
+      inp.type = 'text';
+      inp.placeholder = '卡號(留空用左邊候選)';
+      inp.value = cell.manualId;
+      inp.addEventListener('change', async () => {
+        const v = inp.value.trim();
+        cell.manualId = v;
+        if (v) {
+          cell.selectedId = parseInt(v);
+          try {
+            const r = await fetch('/api/card/' + v);
+            if (r.ok) {
+              const j = await r.json();
+              inp.title = j.name;
+            }
+          } catch (e) {}
+        }
+        updateSummary();
+      });
+      tdManual.appendChild(inp);
+      tr.appendChild(tdManual);
+
+      table.appendChild(tr);
+    });
+    sectionsEl.appendChild(table);
+  });
+  updateSummary();
+}
+
+function groupSection(sec) {
+  const counts = {};
+  sec.cells.forEach(cell => {
+    const id = cell.manualId ? parseInt(cell.manualId) : cell.selectedId;
+    if (!id) return;
+    counts[id] = (counts[id] || 0) + 1;
+  });
+  return counts;
+}
+
+async function updateSummary() {
+  if (!lastResult) return;
+  let html = '';
+  for (const sec of lastResult.sections) {
+    const counts = groupSection(sec);
+    html += `<b>${labelZh(sec.label)}</b> (共 ${Object.values(counts).reduce((a,b)=>a+b,0)} 張)<br>`;
+    for (const [id, n] of Object.entries(counts)) {
+      html += `#${id} x${n}<br>`;
+    }
+  }
+  summaryEl.innerHTML = html;
+}
+
+exportBtn.addEventListener('click', async () => {
+  if (!lastResult) { exportStatus.textContent = '請先分析圖片。'; return; }
+  const deckName = document.getElementById('deckName').value.trim();
+  if (!deckName) { exportStatus.textContent = '請輸入牌組名稱。'; return; }
+
+  const payload = { deck_name: deckName };
+  for (const sec of lastResult.sections) {
+    const counts = groupSection(sec);
+    payload[sec.label] = Object.entries(counts).map(([id, count]) => ({ id: parseInt(id), count }));
+  }
+  exportStatus.textContent = '匯出中...';
+  try {
+    const resp = await fetch('/api/export', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const j = await resp.json();
+    if (!resp.ok) throw new Error(j.error || JSON.stringify(j));
+    exportStatus.textContent = `已寫入 ${j.path} (main=${j.main}, extra=${j.extra}, side=${j.side})`;
+  } catch (e) {
+    exportStatus.textContent = '匯出失敗: ' + e;
+  }
+});
+</script>
+</body>
+</html>
